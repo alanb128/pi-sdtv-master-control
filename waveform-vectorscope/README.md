@@ -5,7 +5,9 @@ This is the folder for the waveform monitor/vectorscope/vu meter.
 Parts:
 
 Touch screen: [ELECROW 5 Inch Touch Screen Monitor for Raspberry Pi 800×480 LCD Display](https://www.amazon.com/dp/B07FDYXPT7)
+
 Tactile push buttons: [Adafruit assortment](https://www.adafruit.com/product/1010), and others
+
 Pi fans: https://www.printables.com/model/328676-raspberry-pi-4-fan-mount-backward-compatible/files
 
 Configuration settings for the Pi 4:
