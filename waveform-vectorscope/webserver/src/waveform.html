@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Waveform Monitor</title>
+
+<style>
+  body { margin:0; background:#000; overflow:hidden; }
+  canvas { width:100vw; height:100vh; display:block; }
+
+  button {
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); 
+            z-index: 10; background: #111; color: #00ff40; border: 1px solid #00ff40; 
+            padding: 20px 40px; font-size: 1.2rem; cursor: pointer; letter-spacing: 1px;
+        }
+  button:hover { background: #00ff40; color: #0a0a0a; }
+
+</style>
+</head>
+<body>
+
+<button id="start">START</button>
+<canvas id="wave"></canvas>
+
+<script>
+const canvas = document.getElementById("wave");
+const ctx = canvas.getContext("2d");
+
+function resize(){
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+}
+window.addEventListener("resize", resize);
+resize();
+
+/* ---------------------------
+   Query params
+----------------------------*/
+const qp = new URLSearchParams(location.search);
+const mode = qp.get("mode") || "luma";
+const gain = Math.max(1, Math.min(40, Number(qp.get("gain")) || 35));
+
+/* ---------------------------
+   Camera
+----------------------------*/
+const video = document.createElement("video");
+video.autoplay = true;
+video.muted = true;
+video.playsInline = true;
+
+const startBtn = document.getElementById("start");
+startBtn.focus();
+
+startBtn.onclick = async () => {
+  startBtn.textContent = "Starting…";
+  startBtn.disabled = true;
+
+  const stream = await navigator.mediaDevices.getUserMedia({video:true});
+  video.srcObject = stream;
+  await video.play();
+
+  startBtn.style.display = "none";
+};
+
+/* ---------------------------
+   Offscreen
+----------------------------*/
+const off = document.createElement("canvas");
+const octx = off.getContext("2d",{willReadFrequently:true});
+
+/* ---------------------------
+   Helpers
+----------------------------*/
+function luma(r,g,b){
+  return (0.2126*r + 0.7152*g + 0.0722*b)|0;
+}
+
+function densityToByte(v){
+  return Math.min(255, Math.log1p(v)*gain);
+}
+
+// fixed scaling: map full canvas to full signal,
+// but leave headroom in draw only (not mapping!)
+function signalForRow(y,h){
+  return Math.round((1 - y / h) * 255);
+}
+
+function drawGraticule(w,h){
+  ctx.save();
+
+  ctx.strokeStyle="rgba(0,255,0,0.30)";
+  ctx.fillStyle="rgba(0,255,0,0.85)";
+  ctx.font="12px monospace";
+  ctx.textAlign="left";
+  ctx.textBaseline="middle";
+
+  const levels=[0,25,50,75,100];
+
+  for(const ire of levels){
+    const signal = (ire/100)*255;
+    //const y = (1 - signal/255) * h;
+    
+const topPad = 0.06 * h;
+const bottomPad = 0.06 * h;
+const drawH = h - topPad - bottomPad;
+
+const y = topPad + (1 - signal/255) * drawH;
+
+
+    ctx.beginPath();
+    ctx.moveTo(0,y);
+    ctx.lineTo(w,y);
+    ctx.stroke();
+
+    ctx.fillText(`${ire} IRE`,8,y);
+  }
+
+  ctx.restore();
+}
+
+/* ---------------------------
+   Frame loop
+----------------------------*/
+function frame(){
+
+  if(video.videoWidth){
+
+    //  w = downsample, min="96" max="640" old default="256"
+    const w=500;
+    const h=Math.round(w * video.videoHeight/video.videoWidth);
+
+    off.width=w;
+    off.height=h;
+
+    octx.drawImage(video,0,0,w,h);
+    const data=octx.getImageData(0,0,w,h).data;
+
+    const outW=canvas.width;
+    const outH=canvas.height;
+
+    const binsR=new Uint16Array(outW*256);
+    const binsG=new Uint16Array(outW*256);
+    const binsB=new Uint16Array(outW*256);
+    const binsY=new Uint16Array(outW*256);
+
+    // accumulate
+    for(let y=0;y<h;y++){
+      for(let x=0;x<w;x++){
+        const i=(x+y*w)*4;
+        const r=data[i], g=data[i+1], b=data[i+2];
+        const outX=(x*outW/w)|0;
+
+        if(mode==="luma"){
+          binsY[outX + luma(r,g,b)*outW]++;
+        }else{
+          binsR[outX + r*outW]++;
+          binsG[outX + g*outW]++;
+          binsB[outX + b*outW]++;
+        }
+      }
+    }
+
+    ctx.fillStyle="#000";
+    ctx.fillRect(0,0,outW,outH);
+
+    const img=ctx.createImageData(outW,outH);
+    const out=img.data;
+
+    const third = outW/3;
+
+    const topPad = 0.06 * outH;
+const bottomPad = 0.06 * outH;
+const drawH = outH - topPad - bottomPad;
+
+for(let oy=0; oy < outH; oy++){
+
+  // Only draw inside padded region
+  if (oy < topPad || oy > outH - bottomPad) continue;
+
+  // Map padded region → full signal range
+  const norm = (oy - topPad) / drawH;
+  const signal = Math.round((1 - norm) * 255);
+
+      for(let ox=0;ox<outW;ox++){
+        const p=(ox+oy*outW)*4;
+
+        if(mode==="luma"){
+          const v=densityToByte(binsY[ox + signal*outW]);
+          out[p]=0;
+          out[p+1]=v;
+          out[p+2]=0;
+        }
+        else if(mode==="overlay"){
+          const r=densityToByte(binsR[ox + signal*outW]);
+          const g=densityToByte(binsG[ox + signal*outW]);
+          const b=densityToByte(binsB[ox + signal*outW]);
+
+          out[p]=r*0.7;
+          out[p+1]=g;
+          out[p+2]=b*0.7;
+        }
+        else{ // parade
+
+          if(ox<third){
+            const sx=(ox/third*outW)|0;
+            out[p]=densityToByte(binsR[sx + signal*outW]);
+          }
+          else if(ox<third*2){
+            const sx=((ox-third)/third*outW)|0;
+            out[p+1]=densityToByte(binsG[sx + signal*outW]);
+          }
+          else{
+            const sx=((ox-third*2)/third*outW)|0;
+            out[p+2]=densityToByte(binsB[sx + signal*outW]);
+          }
+        }
+
+        out[p+3]=255;
+      }
+    }
+
+    ctx.putImageData(img,0,0);
+
+    ctx.shadowColor="rgba(0,255,0,0.4)";
+    ctx.shadowBlur=6;
+
+    drawGraticule(outW,outH);
+
+    ctx.shadowBlur=0;
+  }
+
+  requestAnimationFrame(frame);
+}
+
+frame();
+</script>
+</body>
+</html>
