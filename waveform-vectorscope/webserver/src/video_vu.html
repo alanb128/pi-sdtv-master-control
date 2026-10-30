@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Video with VU Meter</title>
+    <style>
+        html, body {
+            margin: 0; padding: 0; width: 100%; height: 100%;
+            background-color: #000000; overflow: hidden;
+            font-family: monospace; user-select: none;
+        }
+        .hide-cursor { cursor: none; }
+        /* Layer 1: Hardware-Accelerated Video Background */
+        #glCanvas { display: block; width: 100%; height: 100%; position: absolute; top: 0; left: 0; z-index: 1; }
+        /* Layer 2: Transparent Audio Meter Foreground Overlay */
+        #vuCanvas { display: block; width: 100%; height: 100%; position: absolute; top: 0; left: 0; z-index: 2; pointer-events: none; }
+        
+        #startBtn {
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); 
+            z-index: 10; background: #111; color: #00ff40; border: 1px solid #00ff40; 
+            padding: 20px 40px; font-size: 1.2rem; cursor: pointer; letter-spacing: 1px;
+        }
+        #startBtn:hover { background: #00ff40; color: #0a0a0a; }
+    </style>
+</head>
+<body>
+
+    <button id="startBtn" autofocus>START</button>
+
+    <canvas id="glCanvas"></canvas>
+    <canvas id="vuCanvas"></canvas>
+
+<script>
+const glCanvas = document.getElementById('glCanvas');
+const gl = glCanvas.getContext('webgl', { alpha: false, antialias: false, preserveDrawingBuffer: false });
+
+const vuCanvas = document.getElementById('vuCanvas');
+const ctx = vuCanvas.getContext('2d');
+
+const startBtn = document.getElementById('startBtn');
+
+const videoInput = document.createElement('video');
+videoInput.muted = true;
+videoInput.playsInline = true;
+
+// Auto-hide cursor logic
+let mouseTimer;
+document.body.addEventListener('mousemove', () => {
+    document.body.classList.remove('hide-cursor');
+    clearTimeout(mouseTimer);
+    mouseTimer = setTimeout(() => document.body.classList.add('hide-cursor'), 2000);
+});
+
+// Sync both layout contexts on resize
+let cssWidth, cssHeight;
+function resize() {
+    cssWidth = window.innerWidth;
+    cssHeight = window.innerHeight;
+    
+    // WebGL Canvas sizing
+    glCanvas.width = cssWidth;
+    glCanvas.height = cssHeight;
+    gl.viewport(0, 0, glCanvas.width, glCanvas.height);
+    
+    // 2D Overlay Canvas sizing
+    vuCanvas.width = cssWidth * window.devicePixelRatio;
+    vuCanvas.height = cssHeight * window.devicePixelRatio;
+    ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
+}
+window.addEventListener('resize', resize);
+resize();
+
+// --- AUDIO PIPELINE VARIABLES ---
+let audioContext, channelSplitter, analyserL, analyserR, arrayL, arrayR;
+const peakHoldTime = 1500;
+let peakL = { db: -60, time: 0 };
+let peakR = { db: -60, time: 0 };
+const minDb = -60;
+const maxDb = 0;
+
+// --- WEBGL VIDEO PROCESSING SHADERS ---
+const vsSource = `
+    attribute vec2 position;
+    varying vec2 vTexCoord;
+    void main() {
+        vTexCoord = position * 0.5 + 0.5;
+        vTexCoord.y = 1.0 - vTexCoord.y;
+        gl_Position = vec4(position, 0.0, 1.0);
+    }
+`;
+
+const fsSource = `
+    precision mediump float;
+    varying vec2 vTexCoord;
+    uniform sampler2D uVideoTex;
+    void main() {
+        gl_FragColor = texture2D(uVideoTex, vTexCoord);
+    }
+`;
+
+function createShader(gl, type, source) {
+    const shader = gl.createShader(type);
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+    return shader;
+}
+
+const vertexShader = createShader(gl, gl.VERTEX_SHADER, vsSource);
+const fragmentShader = createShader(gl, gl.FRAGMENT_SHADER, fsSource);
+const program = gl.createProgram();
+gl.attachShader(program, vertexShader);
+gl.attachShader(program, fragmentShader);
+gl.linkProgram(program);
+gl.useProgram(program);
+
+const buffer = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, -1,1, 1,-1, 1,1]), gl.STATIC_DRAW);
+
+const posLocation = gl.getAttribLocation(program, "position");
+gl.enableVertexAttribArray(posLocation);
+gl.vertexAttribPointer(posLocation, 2, gl.FLOAT, false, 0, 0);
+
+const texture = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, texture);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+
+// --- AUDIO UTILITIES ---
+function getChannelDb(analyser, dataArray) {
+    if (!analyser) return minDb;
+    analyser.getByteTimeDomainData(dataArray);
+    let sumSquares = 0;
+    for (let i = 0; i < dataArray.length; i++) {
+        const norm = (dataArray[i] / 128.0) - 1.0;
+        sumSquares += norm * norm;
+    }
+    const rms = Math.sqrt(sumSquares / dataArray.length);
+    let db = 20 * Math.log10(rms);
+    if (!isFinite(db) || db < minDb) db = minDb;
+    return db;
+}
+
+function drawMeterBar(x, y, width, height, currentDb, peakObj, now) {
+    const currentPct = (currentDb - minDb) / (maxDb - minDb);
+    
+    if (currentDb >= peakObj.db) {
+        peakObj.db = currentDb;
+        peakObj.time = now;
+    } else if (now - peakObj.time > peakHoldTime) {
+        peakObj.db -= 0.4;
+        if (peakObj.db < minDb) peakObj.db = minDb;
+    }
+    const peakPct = (peakObj.db - minDb) / (maxDb - minDb);
+
+    const totalSegments = 45;
+    const segmentGap = 2;
+    const totalGapSpacing = segmentGap * (totalSegments - 1);
+    const usableHeight = height - totalGapSpacing;
+    const segmentHeight = usableHeight / totalSegments;
+
+    for (let i = 0; i < totalSegments; i++) {
+        const segPct = i / totalSegments;
+        const targetDb = minDb + (segPct * (maxDb - minDb));
+        const segY = y + height - ((i + 1) * (segmentHeight + segmentGap)) + segmentGap;
+        const isLit = currentPct >= segPct;
+
+        let segColor;
+        if (targetDb >= -9) {
+            segColor = isLit ? '#ff2a2a' : 'rgba(74, 10, 10, 0.4)';
+        } else if (targetDb >= -20) {
+            segColor = isLit ? '#ffcc00' : 'rgba(74, 58, 0, 0.4)';
+        } else {
+            segColor = isLit ? '#00ff40' : 'rgba(0, 58, 10, 0.4)';
+        }
+
+        ctx.fillStyle = segColor;
+        ctx.fillRect(x, segY, width, segmentHeight);
+    }
+
+    if (peakPct > 0.02) {
+        const peakY = y + height - (peakPct * height);
+        let peakColor = '#ff2a2a';
+        const targetPeakDb = minDb + (peakPct * (maxDb - minDb));
+        if (targetPeakDb < -9 && targetPeakDb >= -20) peakColor = '#ffcc00';
+        if (targetPeakDb < -20) peakColor = '#00ff40';
+
+        ctx.fillStyle = peakColor;
+        ctx.fillRect(x, peakY, width, 2);
+    }
+}
+
+// --- UNIFIED RENDERING LOOP ---
+function pipelineFrame(now) {
+    // 1. Process and Draw WebGL Video Layer
+    if (videoInput.readyState >= videoInput.HAVE_CURRENT_DATA) {
+        gl.bindTexture(gl.TEXTURE_2D, texture);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, videoInput);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        gl.drawArrays(gl.TRIANGLES, 0, 6);
+    }
+
+    // 2. Process and Draw Transparent 2D VU Overlay Layer
+    ctx.clearRect(0, 0, cssWidth, cssHeight);
+
+    const dbL = getChannelDb(analyserL, arrayL);
+    const dbR = getChannelDb(analyserR, arrayR);
+
+    // Geometry parameters tailored for right-side sidebar overlaying
+    const meterHeight = cssHeight * 0.70;
+    const meterWidth = 14; 
+    const meterY = (cssHeight - meterHeight) / 2;
+    const rightMargin = 25;
+    
+    // Position channel elements close together on the right display boundary
+    const rightChannelX = cssWidth - meterWidth - rightMargin;
+    const leftChannelX = rightChannelX - meterWidth - 8;
+
+    // Draw dark smoky semitransparent backing tray to separate meters from noisy video frames
+    ctx.fillStyle = 'rgba(5, 5, 5, 0.65)';
+    ctx.fillRect(leftChannelX - 10, meterY - 15, (meterWidth * 2) + 28, meterHeight + 45);
+
+    drawMeterBar(leftChannelX, meterY, meterWidth, meterHeight, dbL, peakL, now);
+    drawMeterBar(rightChannelX, meterY, meterWidth, meterHeight, dbR, peakR, now);
+
+    // Overlay compact ticker markers inside the side scale tracking array
+    ctx.font = "9px monospace";
+    ctx.textAlign = "right";
+    ctx.textBaseline = "middle";
+
+    const tickDbs = [0, -6, -12, -20, -30, -45, -60];
+    tickDbs.forEach(db => {
+        const pct = (db - minDb) / (maxDb - minDb);
+        const textY = meterY + meterHeight - (pct * meterHeight);
+
+        ctx.fillStyle = db >= -9 ? '#ff6666' : db >= -20 ? '#ffff66' : '#aaaaaa';
+        ctx.fillText(db, leftChannelX - 4, textY);
+    });
+
+    // Minimalistic Channel Labels
+    ctx.font = "bold 9px monospace";
+    ctx.fillStyle = "#ffffff";
+    ctx.textAlign = "center";
+    ctx.fillText("L", leftChannelX + (meterWidth / 2), meterY + meterHeight + 15);
+    ctx.fillText("R", rightChannelX + (meterWidth / 2), meterY + meterHeight + 15);
+
+    requestAnimationFrame(pipelineFrame);
+}
+
+// --- INITIALIZATION ---
+startBtn.addEventListener('click', async () => {
+    try {
+        resize();
+
+        // A. Enumerate devices for direct selection
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const audioInputs = devices.filter(device => device.kind === 'audioinput');
+        if (audioInputs.length === 0) throw new Error("No physical audio input hardware found.");
+
+        let selectedAudioId = audioInputs[0].deviceId;
+        if (audioInputs.length > 1) {
+            let promptText = "Select your hardware audio capture interface input:\n\n";
+            //let selectedIdx = 0
+            audioInputs.forEach((dev, idx) => {
+                if (dev.label == "MS210x, USB Audio-Direct hardware device without any conversions") {
+                    //alert(`my usb index: ${audioInputs[idx].deviceId}`);
+                    selectedAudioId = audioInputs[idx].deviceId
+                }
+                //promptText += `${idx + 1}: ${dev.label || 'Card Interface Line ' + (idx + 1)}\n`;
+            });
+            //const selection = prompt(promptText, '3');
+            //const selectedIdx = parseInt(selection, 10) - 1;
+            //if (audioInputs[selectedIdx]) selectedAudioId = audioInputs[selectedIdx].deviceId;
+        }
+         
+        if (audioInputs.length > 1) {
+            let promptText = "Multiple audio sources detected on your device.\nType the index number to mount:\n\n";
+            audioInputs.forEach((device, index) => {
+               
+                if (device.label == "MS210x, USB Audio-Direct hardware device without any conversions") {
+                    //alert(`my usb index: ${audioInputs[index].deviceId}`);
+                    selectedDeviceId = audioInputs[index].deviceId
+                }
+               
+            });
+            
+        }
+        
+        // B. Mount unified tracks from the ms210x hardware pipeline
+        const stream = await navigator.mediaDevices.getUserMedia({
+            video: { width: { ideal: 1920 }, height: { ideal: 1080 } },
+            audio: {
+                deviceId: { exact: selectedAudioId },
+                echoCancellation: false,
+                noiseSuppression: false,
+                autoGainControl: false
+            }
+        });
+
+        // C. Route paths to WebGL Video
+        videoInput.srcObject = stream;
+        videoInput.play();
+
+        // --- BLOCK UPDATED TO REDUCE LAG ---
+
+        // D. Route paths to Web Audio Nodes with ultra-low latency configurations
+        audioContext = new (window.AudioContext || window.webkitAudioContext)({
+            latencyHint: 'interactive' // Forces the OS to spin up the smallest possible buffer pool
+        });
+
+        const audioSource = audioContext.createMediaStreamSource(stream);
+
+        channelSplitter = audioContext.createChannelSplitter(2);
+        analyserL = audioContext.createAnalyser();
+        analyserR = audioContext.createAnalyser();
+ 
+        // Drop smoothing and buffer footprints to eliminate calculation lag
+        analyserL.smoothingTimeConstant = 0.0; // Instant response, no mathematical filtering
+        analyserR.smoothingTimeConstant = 0.0;
+        analyserL.fftSize = 32;                // Smallest window possible (16 samples)
+        analyserR.fftSize = 32;
+
+        audioSource.connect(channelSplitter);
+        channelSplitter.connect(analyserL, 0);
+        channelSplitter.connect(analyserR, 1);
+
+        arrayL = new Uint8Array(analyserL.frequencyBinCount);
+        arrayR = new Uint8Array(analyserR.frequencyBinCount);
+
+        startBtn.style.display = 'none';
+        requestAnimationFrame(pipelineFrame);
+    } catch (err) {
+        alert("Unified hardware mapping failed: " + err.message);
+    }
+});
+</script>
+
+</body>
+</html>
