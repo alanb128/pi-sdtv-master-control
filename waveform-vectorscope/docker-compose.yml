@@ -1,0 +1,39 @@
+version: '2.4'
+volumes:
+  settings: {}
+networks:
+  frontend:
+    driver: bridge
+services:
+  browser:
+    image: bh.cr/balenasolutions/browser-raspberrypi5/2.12.2
+    ports:
+      - '5011'
+      - '35173'
+    volumes:
+      - settings:/data
+    networks:
+      - frontend
+    depends_on:
+      - webserver
+    privileged: true
+  webserver:
+    build:
+      context: ./webserver
+    expose:
+      - '80'
+    labels:
+      io.balena.features.supervisor-api: '1'
+    restart: always
+    networks:
+      - frontend
+    privileged: true
+  controller:
+    build:
+      context: ./controller
+    labels:
+      io.balena.features.supervisor-api: '1'
+    restart: always
+    networks:
+      - frontend
+    privileged: true
