@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Vectorscope</title>
+
+<style>
+  body {
+    margin: 0;
+    background: #000;
+    overflow: hidden;
+  }
+  canvas {
+    width: 100vw;
+    height: 100vh;
+    display: block;
+  }
+
+  button {
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); 
+            z-index: 10; background: #111; color: #00ff40; border: 1px solid #00ff40; 
+            padding: 20px 40px; font-size: 1.2rem; cursor: pointer; letter-spacing: 1px;
+        }
+  button:hover { background: #00ff40; color: #0a0a0a; }
+</style>
+</head>
+<body>
+
+<button id="start" autofocus>START</button>
+<canvas id="vec"></canvas>
+
+<script>
+const canvas = document.getElementById("vec");
+const ctx = canvas.getContext("2d");
+// gain = 1 to 40; avg 12
+const gain = 30
+//document.getElementById("start").focus();
+
+function resize() {
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+}
+window.addEventListener("resize", resize);
+resize();
+
+/* ---------------------------
+   Camera setup
+----------------------------*/
+let video = document.createElement("video");
+video.autoplay = true;
+video.muted = true;
+video.playsInline = true;
+
+const startBtn = document.getElementById("start");
+
+startBtn.onclick = async () => {
+  const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+  video.srcObject = stream;
+  await video.play();
+
+  // Hide button after success
+  startBtn.style.display = "none";
+};
+
+/* ---------------------------
+   Offscreen capture
+----------------------------*/
+const off = document.createElement("canvas");
+const octx = off.getContext("2d");
+
+/* ---------------------------
+   Vectorscope bins
+----------------------------*/
+const SIZE = 256;
+let count = new Uint32Array(SIZE * SIZE);
+let sumR  = new Uint32Array(SIZE * SIZE);
+let sumG  = new Uint32Array(SIZE * SIZE);
+let sumB  = new Uint32Array(SIZE * SIZE);
+
+/* ---------------------------
+   RGB → UV (YCbCr-style)
+----------------------------*/
+function rgbToUV(r, g, b) {
+  const Y = 0.2126*r + 0.7152*g + 0.0722*b;
+
+  let U = (b - Y) / 1.8556 + 128;
+  let V = (r - Y) / 1.5748 + 128;
+
+  U = Math.max(0, Math.min(255, U));
+  V = Math.max(0, Math.min(255, V));
+
+  return [U|0, V|0];
+}
+
+/* ---------------------------
+   Graticule
+----------------------------*/
+function drawGraticule() {
+  const w = canvas.width;
+  const h = canvas.height;
+  const cx = w/2;
+  const cy = h/2;
+  const r = Math.min(w,h)*0.45;
+  const r75 = r*0.75;
+
+  ctx.strokeStyle = "rgba(0,255,0,0.3)";
+  ctx.beginPath();
+  ctx.arc(cx,cy,r,0,Math.PI*2);
+  ctx.stroke();
+
+  ctx.strokeStyle = "rgba(0,255,0,0.2)";
+  ctx.beginPath();
+  ctx.arc(cx,cy,r75,0,Math.PI*2);
+  ctx.stroke();
+
+  ctx.beginPath();
+  ctx.moveTo(cx-r,cy);
+  ctx.lineTo(cx+r,cy);
+  ctx.moveTo(cx,cy-r);
+  ctx.lineTo(cx,cy+r);
+  ctx.stroke();
+
+  const targets = [
+    {name:"R",deg:0},
+    {name:"Mg",deg:60},
+    {name:"B",deg:120},
+    {name:"Cy",deg:180},
+    {name:"G",deg:240},
+    {name:"Yl",deg:300},
+  ];
+
+  ctx.font = "12px monospace";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+
+  for (const t of targets) {
+    const rad = (t.deg-90)*Math.PI/180;
+    const x = cx + Math.cos(rad)*r75;
+    const y = cy + Math.sin(rad)*r75;
+
+    ctx.strokeStyle="#0f0";
+    ctx.strokeRect(x-6,y-6,12,12);
+
+    const lx = cx + Math.cos(rad)*(r75+20);
+    const ly = cy + Math.sin(rad)*(r75+20);
+    ctx.fillStyle="#0f0";
+    ctx.fillText(t.name,lx,ly);
+  }
+}
+
+/* ---------------------------
+   Render loop
+----------------------------*/
+function frame() {
+  if (video.videoWidth) {
+
+    // downsample
+    const w = 256;
+    const h = Math.round(w * video.videoHeight / video.videoWidth);
+    off.width = w;
+    off.height = h;
+
+    octx.drawImage(video,0,0,w,h);
+    const data = octx.getImageData(0,0,w,h).data;
+
+    count.fill(0);
+    sumR.fill(0);
+    sumG.fill(0);
+    sumB.fill(0);
+
+    // accumulate
+    for (let i=0;i<data.length;i+=4) {
+      const r=data[i], g=data[i+1], b=data[i+2];
+      const [U,V] = rgbToUV(r,g,b);
+      const idx = U + (V<<8);
+
+      count[idx]++;
+      sumR[idx]+=r;
+      sumG[idx]+=g;
+      sumB[idx]+=b;
+    }
+
+    // draw
+    ctx.fillStyle="#000";
+    ctx.fillRect(0,0,canvas.width,canvas.height);
+
+    const img = ctx.createImageData(canvas.width,canvas.height);
+    const out = img.data;
+
+    for (let y=0;y<canvas.height;y++) {
+      const V = 255 - (y * 255 / canvas.height);
+      const vOff = (V|0)<<8;
+
+      for (let x=0;x<canvas.width;x++) {
+        const U = (x * 255 / canvas.width)|0;
+        const idx = U + vOff;
+
+        const c = count[idx];
+        const p = (x + y*canvas.width) * 4;
+
+        if (c>0) {
+          const bright = Math.min(255, Math.log1p(c)*gain);
+          const s = bright/255;
+
+          out[p]   = (sumR[idx]/c * s)|0;
+          out[p+1] = (sumG[idx]/c * s)|0;
+          out[p+2] = (sumB[idx]/c * s)|0;
+        }
+        out[p+3]=255;
+      }
+    }
+
+    ctx.putImageData(img,0,0);
+    drawGraticule();
+  }
+
+  requestAnimationFrame(frame);
+}
+
+frame();
+</script>
+</body>
+</html>
