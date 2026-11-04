@@ -23,6 +23,8 @@ Your Pi 5 should have an active cooler if the scopes will be running long term.
 
 More to follow, for now, [see the video](https://youtu.be/dvhU6qKurbk?si=hsHPz8lPBxtPz9eP&t=440).
 
+<img src="scope-build.jpg'>
+
 ## Setup
 This device is designed to be used on [balenaOS](https://www.balena.io/) - you can set up a free account there and have up to 10 devices at no charge. Create a new fleet, add a device, and use the balenaCLI to push this as a new release to your device(s). More detailed instructions to follow eventually.
 
